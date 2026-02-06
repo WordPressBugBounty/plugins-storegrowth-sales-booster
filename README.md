@@ -1,0 +1,1 @@
+# plugins-storegrowth-sales-booster
