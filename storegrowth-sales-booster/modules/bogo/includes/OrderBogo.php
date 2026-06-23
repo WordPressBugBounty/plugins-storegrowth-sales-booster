@@ -38,6 +38,7 @@ class OrderBogo implements HookRegistry {
 		add_filter( 'woocommerce_product_data_tabs', array( $this, 'add_bogo_product_data_tab' ) );
 		add_action( 'woocommerce_product_data_panels', array( $this, 'add_bogo_product_data_fields' ) );
 		add_action( 'woocommerce_process_product_meta', array( $this, 'save_bogo_settings' ) );
+		add_action( 'admin_notices', array( $this, 'show_bogo_product_save_notice' ) );
 
 		add_action( 'woocommerce_cart_item_removed', array( $this, 'remove_linked_bogo_product' ), 10, 2 );
 		add_filter( 'woocommerce_cart_item_class', array( $this, 'add_custom_class_to_offer_product' ), 10, 3 );
@@ -52,7 +53,30 @@ class OrderBogo implements HookRegistry {
 
         // Prevent BOGO offers product removing option from the cart.
 		add_action( 'woocommerce_remove_cart_item', array( $this, 'prevent_bogo_cart_item_remove' ), 10, 2 );
+
+		// FlyCart integration: show BOGO badge and original price on free items.
+		add_action( 'spsg_fly_cart_item_bogo_badge', array( $this, 'display_bogo_badge_in_fly_cart' ), 10, 3 );
+		add_filter( 'spsg_fly_cart_item_price_html', array( $this, 'modify_fly_cart_bogo_price_html' ), 10, 3 );
     }
+
+	/**
+	 * Show a one-time admin notice when a product BOGO could not be enabled on save
+	 * (e.g. "Enable BOGO" was checked but no offer product was selected).
+	 */
+	public function show_bogo_product_save_notice() {
+		$key     = 'spsg_bogo_product_notice_' . get_current_user_id();
+		$message = get_transient( $key );
+
+		if ( empty( $message ) ) {
+			return;
+		}
+
+		delete_transient( $key );
+		printf(
+			'<div class="notice notice-warning is-dismissible"><p>%s</p></div>',
+			esc_html( $message )
+		);
+	}
 
     public function display_bogo_floating_badge_on_product() {
 		global $product;
@@ -480,18 +504,39 @@ class OrderBogo implements HookRegistry {
 			return;
 		}
 
+		$variation_id         = 0;
+		$variation_attributes = array();
+		$price_product        = $product; // Product used for price calculation.
+
+		// Handle variable gift products - resolve the variation to add.
+		if ( $product->is_type( 'variable' ) ) {
+			$resolved = $this->resolve_gift_variation( $offer_product_id, $product );
+
+			if ( empty( $resolved ) ) {
+				return; // No purchasable variation available.
+			}
+
+			$variation_id         = $resolved['variation_id'];
+			$variation_attributes = $resolved['attributes'];
+			$price_product        = wc_get_product( $variation_id );
+
+			if ( ! $price_product ) {
+				return;
+			}
+		}
+
 		// Determine the cost of the offer product (if necessary)
 		$offer_product_cost = 0; // Assume free by default
 		if ( isset( $settings['offer_type'] ) && $settings['offer_type'] === 'discount' ) {
-			$offer_product_cost = max( $product->get_price() - ( $product->get_price() * ( $settings['discount_amount'] / 100 ) ), 0 );
+			$offer_product_cost = max( $price_product->get_price() - ( $price_product->get_price() * ( $settings['discount_amount'] / 100 ) ), 0 );
 		}
 
 		// Add the offer product to the cart for different offer.
 		$free_product_key = WC()->cart->add_to_cart(
 			$offer_product_id,
 			$quantity, // Quantity of the offer product
-			'',
-			'',
+			$variation_id,
+			$variation_attributes,
 			array(
 				'parent_key'            => $cart_item_key,
 				'bogo_offer'            => true,
@@ -504,6 +549,79 @@ class OrderBogo implements HookRegistry {
 		if ( $free_product_key && isset( WC()->cart->cart_contents[ $cart_item_key ] ) ) {
 			WC()->cart->cart_contents[ $cart_item_key ]['child_key'] = $free_product_key;
 		}
+	}
+
+	/**
+	 * Resolve the variation to use for a variable gift product.
+	 *
+	 * Priority: user-selected variation → default variation → first available variation.
+	 *
+	 * @param int         $offer_product_id The parent variable product ID.
+	 * @param \WC_Product $product          The variable product object.
+	 * @return array|null Array with 'variation_id' and 'attributes', or null if none available.
+	 */
+	private function resolve_gift_variation( $offer_product_id, $product ) {
+		$variation_id         = 0;
+		$variation_attributes = array();
+
+		// Check if user selected a variation via the frontend form.
+		// phpcs:disable WordPress.Security.NonceVerification.Missing -- Nonce verified by WooCommerce add-to-cart flow.
+		$posted_gift_product_id = ! empty( $_POST['bogo_gift_product_id'] ) ? intval( $_POST['bogo_gift_product_id'] ) : 0;
+
+		if ( $posted_gift_product_id === $offer_product_id ) {
+			$variation_id         = ! empty( $_POST['bogo_gift_variation_id'] ) ? intval( $_POST['bogo_gift_variation_id'] ) : 0;
+			$variation_attributes = ! empty( $_POST['bogo_gift_variation'] ) ? wc_clean( wp_unslash( $_POST['bogo_gift_variation'] ) ) : array();
+			$variation_attributes = is_array( $variation_attributes ) ? $variation_attributes : array();
+		}
+		// phpcs:enable WordPress.Security.NonceVerification.Missing
+
+		// Validate the posted variation belongs to this product.
+		if ( $variation_id ) {
+			$variation_product = wc_get_product( $variation_id );
+			if ( ! $variation_product || $variation_product->get_parent_id() !== $offer_product_id ) {
+				$variation_id         = 0;
+				$variation_attributes = array();
+			}
+		}
+
+		// Fallback: use the default variation, or first available.
+		if ( ! $variation_id ) {
+			$available_variations = $product->get_available_variations();
+			if ( ! empty( $available_variations ) ) {
+				$default_variation_id = 0;
+				$default_attributes   = $product->get_default_attributes();
+
+				if ( ! empty( $default_attributes ) ) {
+					$prefixed_defaults    = array_combine(
+						array_map( fn( $key ) => 'attribute_' . $key, array_keys( $default_attributes ) ),
+						array_values( $default_attributes )
+					);
+					$data_store           = \WC_Data_Store::load( 'product' );
+					$default_variation_id = $data_store->find_matching_product_variation( $product, $prefixed_defaults );
+				}
+
+				if ( $default_variation_id ) {
+					$default_variation_product = wc_get_product( $default_variation_id );
+					if ( ! $default_variation_product ) {
+						return null;
+					}
+					$variation_id         = $default_variation_id;
+					$variation_attributes = $default_variation_product->get_variation_attributes();
+				} else {
+					$variation_id         = $available_variations[0]['variation_id'];
+					$variation_attributes = $available_variations[0]['attributes'];
+				}
+			}
+		}
+
+		if ( ! $variation_id ) {
+			return null;
+		}
+
+		return array(
+			'variation_id' => $variation_id,
+			'attributes'   => $variation_attributes,
+		);
 	}
 
 	/**
@@ -628,14 +746,34 @@ class OrderBogo implements HookRegistry {
 			}
 		}
 
-		// Check for product-specific BOGO settings first
-		$product_bogo_settings = Helper::get_product_bogo_settings( $current_product_id );
-		
-		if ( $product_bogo_settings && isset( $product_bogo_settings['status'] ) && 'active' === $product_bogo_settings['status'] ) {
-			$this->display_bogo_offer( $product_bogo_settings, $current_product_id, $current_product_id );
+		// A product-specific (type=product) offer takes precedence: if one is active,
+		// show ONLY it and do not also render global offers for this product.
+		$product_offers = \StorePulse\StoreGrowth\Modules\BoGo\BogoDataManager::get_bogo_offers(
+			array(
+				'type'         => 'product',
+				'product_id'   => $current_product_id,
+				'variation_id' => 0,
+				'status'       => 'active',
+			)
+		);
+
+		$product_bogo_settings = ! empty( $product_offers ) ? $product_offers[0] : null;
+
+		if ( $product_bogo_settings ) {
+			// Resolve the actual gift product. For a "Buy X Get Y" offer this is a
+			// different product; passing the current product id would render the wrong
+			// same-product template and hide the gift product on the product page.
+			$offer_product_id = BogoValidator::get_offer_product_id( $product_bogo_settings, $current_product_id );
+
+			if ( $offer_product_id ) {
+				$this->display_bogo_offer( $product_bogo_settings, $current_product_id, $offer_product_id );
+				return; // Product offer shown; it overrides any global offer.
+			}
+			// Active product offer without a usable gift product: fall through to
+			// global offers instead of showing nothing.
 		}
 
-		// Check for global BOGO offers
+		// No applicable product-specific offer → show global BOGO offers.
 		$global_bogo_offers = Helper::get_global_offered_products();
 		
 		foreach ( $global_bogo_offers as $bogo_offer ) {
@@ -669,7 +807,12 @@ class OrderBogo implements HookRegistry {
 		$discount_amount = $bogo_settings['discount_amount'] ?? 0;
 		
 		$image_url = get_the_post_thumbnail_url( $offer_product_id, 'full' );
-		$_product  = wc_get_product( $offer_product_id );
+		// Fall back to WooCommerce's standard "no image" placeholder (not the
+		// upsell-bump graphic) when the offer product has no featured image.
+		if ( empty( $image_url ) ) {
+			$image_url = wc_placeholder_img_src( 'woocommerce_thumbnail' );
+		}
+		$_product = wc_get_product( $offer_product_id );
 		
 		// Check if product exists before accessing its methods
 		if ( ! $_product ) {
@@ -700,6 +843,10 @@ class OrderBogo implements HookRegistry {
 		
 		// Include the appropriate template
 		if ( $current_product_id === $offer_product_id ) {
+			// The same-product ("Buy X Get X") template guards on $product, which is
+			// the current/offer product here. Without it the box renders nothing.
+			$product = $_product;
+
 			$template_path = __DIR__ . '/../templates/bogo-product-meta-front-view.php';
 			if ( file_exists( $template_path ) ) {
 				include $template_path;
@@ -891,8 +1038,60 @@ class OrderBogo implements HookRegistry {
 			$is_variable_product
 		);
 
+		// Validate an enabled "Buy X Get Y" offer like the admin BOGO form: it must
+		// have an offer product. Otherwise force it inactive so we never create an
+		// active-but-empty product offer that silently shadows global offers, and
+		// surface a notice so the merchant knows it was not enabled.
+		if ( ! $is_variable_product && 'active' === $bogo_enabled && 'same' !== $deal_type
+			&& empty( $bogo_settings_data['get_different_product_field'] ) ) {
+			$bogo_enabled                 = 'inactive';
+			$bogo_settings_data['status'] = 'inactive';
+			set_transient(
+				'spsg_bogo_product_notice_' . get_current_user_id(),
+				__( 'BOGO was not enabled for this product — please select an offer product for a "Buy X Get Y" offer.', 'storegrowth-sales-booster' ),
+				60
+			);
+		}
+
+		// Only persist a product BOGO when the merchant has actually configured one.
+		// Without this guard a row was written on every product create/update, leaving
+		// empty "inactive" BOGO entries for products that never used the feature.
+		// An already-existing row is still saved so it can be edited or disabled.
+		$is_bogo_enabled   = ( 'active' === $bogo_enabled );
+		$has_offer_product = ! empty( $bogo_settings_data['get_different_product_field'] );
+		$has_existing_bogo = ! empty(
+			\StorePulse\StoreGrowth\Modules\BoGo\BogoDataManager::get_bogo_offers(
+				array(
+					'type'         => 'product',
+					'product_id'   => $post_id,
+					'variation_id' => 0,
+					'status'       => '',
+				)
+			)
+		);
+
+		/**
+		 * Filters whether a product-specific BOGO offer should be saved on product save.
+		 *
+		 * @param bool  $should_save         Whether to persist the product BOGO.
+		 * @param int   $post_id             Product ID.
+		 * @param array $bogo_settings_data  BOGO settings being saved.
+		 * @param bool  $is_variable_product Whether the product is variable.
+		 */
+		$should_save_bogo = apply_filters(
+			'spsg_should_save_product_bogo',
+			$is_bogo_enabled || $has_offer_product || $has_existing_bogo,
+			$post_id,
+			$bogo_settings_data,
+			$is_variable_product
+		);
+
+		if ( ! $should_save_bogo ) {
+			return;
+		}
+
 		\StorePulse\StoreGrowth\Modules\BoGo\BogoDataManager::save_product_bogo_settings( $post_id, 0, $bogo_settings_data );
-		
+
 		// Sync offer schedules between product and global offers
 		\StorePulse\StoreGrowth\Modules\BoGo\BogoDataManager::sync_offer_schedules( $post_id );
 	}
@@ -952,4 +1151,116 @@ class OrderBogo implements HookRegistry {
             }
         }
     }
+	/**
+	 * Display the BOGO badge on free items shown in the FlyCart.
+	 *
+	 * Hooked into `spsg_fly_cart_item_bogo_badge` (action) by the BOGO module so that
+	 * the FlyCart template does not need any direct knowledge of BOGO logic.
+	 *
+	 * @param array      $cart_item     Cart item data.
+	 * @param string     $cart_item_key Cart item key.
+	 * @param WC_Product $_product      Product object.
+	 */
+	public function display_bogo_badge_in_fly_cart( $cart_item, $cart_item_key, $_product ) {
+		if ( empty( $cart_item['bogo_offer'] ) ) {
+			return;
+		}
+
+		/**
+		 * Controls whether the BOGO badge is shown on items in the FlyCart.
+		 * Defaults to false: the "Show BOGO Badge" control is a Pro feature, so
+		 * the badge stays hidden in the free plugin. Pro hooks here to honor the
+		 * `fly_cart_badge_icon` setting.
+		 *
+		 * @since 2.1.0
+		 *
+		 * @param bool  $enabled      Whether the badge should be displayed.
+		 * @param array $cart_item    Cart item data.
+		 * @param string $cart_item_key Cart item key.
+		 */
+		if ( ! apply_filters( 'spsg_bogo_fly_cart_badge_enabled', false, $cart_item, $cart_item_key ) ) {
+			return;
+		}
+
+		$is_pro          = sp_store_growth()->has_pro();
+		$offer_badge     = '';
+		$offer_badge_url = '';
+		$shop_page_msg   = '';
+		$product_page_msg = '';
+
+		// Try to load badge settings from the parent product's BOGO offer.
+		$parent_product_id = ! empty( $cart_item['bogo_product_for'] ) ? intval( $cart_item['bogo_product_for'] ) : 0;
+		if ( $parent_product_id ) {
+			$bogo_settings = Helper::get_product_bogo_settings( $parent_product_id );
+			if ( ! empty( $bogo_settings ) ) {
+				if ( ! empty( $bogo_settings['enable_custom_badge_image'] ) ) {
+					$offer_badge     = ! empty( $bogo_settings['default_badge_icon_name'] ) ? esc_html( $bogo_settings['default_badge_icon_name'] ) : '';
+					$offer_badge_url = $is_pro && ! empty( $bogo_settings['default_custom_badge_icon'] ) ? esc_url( $bogo_settings['default_custom_badge_icon'] ) : '';
+				} else {
+					$offer_badge     = Helper::get_bogo_settings_option( 'default_badge_icon_name' );
+					$offer_badge_url = $is_pro ? Helper::get_bogo_settings_option( 'default_custom_badge_icon' ) : '';
+				}
+				$shop_page_msg    = ! empty( $bogo_settings['shop_page_message'] ) ? esc_html( $bogo_settings['shop_page_message'] ) : '';
+				$product_page_msg = ! empty( $bogo_settings['product_page_message'] ) ? esc_html( $bogo_settings['product_page_message'] ) : '';
+			}
+		}
+
+		// Fallback to global BOGO badge settings.
+		if ( empty( $offer_badge ) && empty( $offer_badge_url ) ) {
+			$offer_badge     = Helper::get_bogo_settings_option( 'default_badge_icon_name' );
+			$offer_badge_url = $is_pro ? Helper::get_bogo_settings_option( 'default_custom_badge_icon' ) : '';
+		}
+
+		if ( empty( $offer_badge ) && empty( $offer_badge_url ) ) {
+			return;
+		}
+
+		$path = apply_filters( 'spsg_load_bogo_badge_content', __DIR__ . '/../templates/bogo-offer-badge.php', array() );
+		if ( ! file_exists( $path ) ) {
+			return;
+		}
+
+		include $path;
+	}
+
+	/**
+	 * Show the original (regular) price with strikethrough alongside the free offer
+	 * price for BOGO items displayed inside the FlyCart.
+	 *
+	 * Hooked into `spsg_fly_cart_item_price_html` (filter) so that the FlyCart template
+	 * does not need any direct knowledge of BOGO logic.
+	 *
+	 * @param string     $price_html Current price HTML (already computed by the template).
+	 * @param array      $cart_item  Cart item data.
+	 * @param WC_Product $_product   Product object.
+	 *
+	 * @return string Modified price HTML.
+	 */
+	public function modify_fly_cart_bogo_price_html( $price_html, $cart_item, $_product ) {
+		if ( empty( $cart_item['bogo_offer'] ) || ! isset( $cart_item['bogo_offer_price'] ) ) {
+			return $price_html;
+		}
+
+		$regular_price = floatval( $_product->get_regular_price() );
+		if ( $regular_price <= 0 ) {
+			return $price_html;
+		}
+
+		$quantity = intval( $cart_item['quantity'] );
+
+		// Honor the store's tax display setting so the struck-through original
+		// matches the tax-in/exclusive prices shown elsewhere in the cart.
+		$display_price = wc_get_price_to_display(
+			$_product,
+			array(
+				'price' => $regular_price,
+				'qty'   => $quantity,
+			)
+		);
+		$original_html = wc_price( $display_price );
+
+		return '<span class="spsg-bogo-fly-cart-original-price"><s>' . $original_html . '</s></span>'
+			. '<span class="spsg-bogo-fly-cart-offer-price">' . $price_html . '</span>';
+	}
+
 }

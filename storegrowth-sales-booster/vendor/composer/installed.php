@@ -1,9 +1,9 @@
 <?php return array(
     'root' => array(
         'name' => 'dokan/storegrowth-lite',
-        'pretty_version' => 'v2.0.6',
-        'version' => '2.0.6.0',
-        'reference' => 'c3ffdc518f78a7bfe3bb3970325460cfda576b27',
+        'pretty_version' => 'v2.1.0',
+        'version' => '2.1.0.0',
+        'reference' => '3b297278419efbe09fd0c7df322892b1c99cdd5c',
         'type' => 'library',
         'install_path' => __DIR__ . '/../../',
         'aliases' => array(),
@@ -11,9 +11,9 @@
     ),
     'versions' => array(
         'dokan/storegrowth-lite' => array(
-            'pretty_version' => 'v2.0.6',
-            'version' => '2.0.6.0',
-            'reference' => 'c3ffdc518f78a7bfe3bb3970325460cfda576b27',
+            'pretty_version' => 'v2.1.0',
+            'version' => '2.1.0.0',
+            'reference' => '3b297278419efbe09fd0c7df322892b1c99cdd5c',
             'type' => 'library',
             'install_path' => __DIR__ . '/../../',
             'aliases' => array(),
